@@ -4,11 +4,13 @@ require 'pp'
 require 'csv'
 require 'json'
 require 'net/http'
+require 'yaml'
 
 #############
 # Variables #
 #############
-
+Current_Dir       = File.expand_path File.dirname(__FILE__)
+CPU_Memory_Ratios = "#{Current_Dir}/cpu_memory_ratios.yml"
 
 ################
 # Optionparser #
@@ -65,6 +67,16 @@ end
 #############
 # Functions #
 #############
+
+def nested_hash_value(obj,key)
+  if obj.respond_to?(:key?) && obj.key?(key)
+    obj[key]
+  elsif obj.respond_to?(:each)
+    r = nil
+    obj.find{ |*a| r=nested_hash_value(a.last,key) }
+    r
+  end
+end
 
 def parse_cpu_csv(csv)
   begin
@@ -211,19 +223,33 @@ def simplify_data_hash(json)
       clock         = attr["clockSpeed"]
       network       = attr["networkPerformance"]
       os            = attr["operatingSystem"]
-      sku           = attr["sku"]
+      sku           = hash["sku"]
 
-      subdata = { "family"   => family,
-                  "vcpus"    => vcpus,
-                  "memory"   => memory,
-                  "storage"  => storage,
-                  "clock"    => clock,
-                  "network"  => network,
-                  "location" => location,
-                  "os"       => os, 
-                  "sku"      => sku }
+      # Now let's find out price
+      reserved_sku  = json["terms"]["Reserved"][sku]
+      on_demand_sku = json["terms"]["OnDemand"][sku]
+      
+      reserved_unit  = nested_hash_value(reserved_sku,"unit")
+      reserved_price = nested_hash_value(reserved_sku,"USD")
+     
+      on_demand_unit  = nested_hash_value(on_demand_sku,"unit")
+      on_demand_price = nested_hash_value(on_demand_sku,"USD")
+      
+      subdata = { "family"          => family,
+                  "vcpus"           => vcpus,
+                  "memory"          => memory,
+                  "storage"         => storage,
+                  "clock"           => clock,
+                  "network"         => network,
+                  "location"        => location,
+                  "os"              => os, 
+                  "reserved_unit"   => reserved_unit,
+                  "on_demand_unit"  => on_demand_unit,
+                  "reserved_price"  => reserved_price,
+                  "on_demand_price" => on_demand_price }
 
       data[instance_type].push(subdata)
+      data[instance_type].uniq!
     end
   end
 
@@ -314,7 +340,6 @@ end
 # AWS DATA PARSING #
 #------------------#
 # Cache our offering file from AWS
-=begin
 if options[:cache] == true
   printf "Caching AWS JSON offering\n"
   rc = cache_offer
@@ -338,9 +363,7 @@ json = parse_text_to_data_hash(offer)
 
 # Let's put it into a format we can understand
 #
-data = simplify_data_hash(json)
-=end
-
+aws_data = simplify_data_hash(json)
 
 ########################
 # Galileo DATA PARSING #
@@ -360,22 +383,95 @@ if options[:token] == nil
   exit 1
 end
 
+
 item_id = options[:itemid] if options[:itemid]
 time    = options[:time]   if options[:time]
 site    = options[:site]   if options[:site]
 token   = options[:token]  if options[:token]
+region  = options[:region] if options[:region]
+region  = "US East (Ohio)" if region == nil
 
 machine_data = pull_machine_data(site,item_id,token,time)
-pp machine_data
 
+cpuavg    = machine_data["cpu"]["average"]
+cpupeak   = machine_data["cpu"]["peak"]
+memavg    = machine_data["memory"]["cache"]["average"] / 1024
+mempeak   = machine_data["memory"]["cache"]["peak"] / 1024
+memavgnc  = machine_data["memory"]["no cache"]["average"] / 1024
+mempeaknc = machine_data["memory"]["no cache"]["peak"] / 1024
 
-exit
 # Find our CPU to Memory Ratio
 #
-cpu_memory_ratio = cpu["average"].to_f / (memory["cache"]["average"] / 1024).to_f
+cpu_memory_ratio   = machine_data["cpu"]["average"].to_f / (machine_data["memory"]["cache"]["average"] / 1024).to_f
+cpu_ncmemory_ratio = machine_data["cpu"]["average"].to_f / (machine_data["memory"]["no cache"]["average"] / 1024).to_f
+
+printf "\n##################\n"
+printf "# Machine Summary#\n"
+printf "#----------------#\n"
+printf "%-10s %-10s %-10s %-12s %-12s %-22s %-22s\n", "item_id", "CPU Avg", "CPU Peak", "Memory Avg", "Memory Peak", "Memory No Cache Avg", "Memory No Cache Peak"
+printf "%-10s %-10s %-10s %-12s %-12s %-22s %-22s\n", item_id, cpuavg, cpupeak, memavg.round(2), mempeak.round(2), memavgnc.round(2), mempeaknc.round(2)
 
 
-printf "CPU average/peak: #{cpu["average"]}, #{cpu["peak"]}\n"
-printf "Memory average/peak: #{memory["average"]}, #{memory["peak"]}\n"
+=begin
+printf "\n########### CPU/Memory Ratio #############\n"
+printf "%-10s %-25s %-25s\n", "item_id", "CPU/Memory Ratio", "CPU/Memory No Cache Ratio"
+printf "%-10s %-25s %-25s\n", item_id, cpu_memory_ratio.round(2), cpu_ncmemory_ratio.round(2)
+=end
 
-pp memory
+=begin
+###################################
+# Load Static CPU / Memory Ratios #
+#---------------------------------#
+if ! File.exist?(CPU_Memory_Ratios)
+  printf "#{CPU_Memory_Ratios} file doesn't exist\n"
+  exit
+end
+
+ratios = YAML.load_file(CPU_Memory_Ratios)
+=end
+
+printf "\n#############################\n"
+printf "# Predictive Instance Guess #\n"
+printf "#---------------------------#\n"
+printf "%-15s %-8s %-10s %-20s %-20s %-10s %-20s %-15s %-25s %-25s\n", "Type", "vCPUs", "Memory", "Family", "Storage", "Clock", "Network", "Region", "Reserved Price (mo)", "On Demand Price (mo)"
+aws_data.each do |k,v|
+  v.each do |e|
+    next unless e["location"] == region 
+    next unless e["os"] == "Linux"
+
+    
+    instance_memory = e["memory"].split(" ")[0].to_f
+
+    reserved_price = nil
+    unless e["reserved_unit"] == nil or e["reserved_unit"] == "Quantity"
+      if e["reserved_unit"] == "Hrs"
+        reserved_price = (e["reserved_price"].to_f * 720).round(2)
+      end
+
+      if e["reserved_unit"] == "Quantity"
+        reserved_price = e["reserved_price"]
+      end
+    end
+
+    on_demand_price = nil
+    unless e["on_demand_unit"] == nil or e["on_demand_unit"] == "Quantity"
+      if e["on_demand_unit"] == "Hrs"
+        on_demand_price = (e["on_demand_price"].to_f * 720).round(2)
+      end
+
+      if e["on_demand_unit"] == "Quantity"
+        on_demand_price = e["on_demand_price"]
+      end
+    end
+    
+    next if on_demand_price == nil and reserved_price == nil
+    next if on_demand_price == 0.0 and reserved_price == 0.0
+    next if on_demand_price == ""  and reserved_price == ""
+    next if on_demand_price == ""  and reserved_price == 0.0
+    next if on_demand_price == nil and reserved_price == 0.0
+
+    if e["vcpus"].to_f > cpuavg.to_f and instance_memory > memavgnc
+      printf "%-15s %-8s %-10s %-20s %-20s %-10s %-20s %-15s %-25s %-25s\n", k, e["vcpus"], e["memory"], e["family"], e["storage"], e["clock"], e["network"], e["location"], "$#{reserved_price}", "$#{on_demand_price}" 
+    end
+  end
+end
